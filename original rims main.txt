@@ -1,0 +1,413 @@
+
+# from defines import *
+import time
+
+import numpy as np
+import tkinter as tk
+import copy
+from predefined_tests import *
+from output import plot_average_speed_of_ions, plot_potential_profile, plot_multiple_ions_hist
+from scipy import interpolate
+import multiprocessing as mp
+import csv
+from multiprocessing import Pool
+import numpy as np
+import matplotlib.pyplot as plt
+
+from datetime import datetime
+from time import sleep
+import random
+from random import random
+from mpl_toolkits.mplot3d import Axes3D
+
+
+        
+
+
+class Rims:
+
+    # region setup (init)
+    def __init__(self, ion_dict, potential_profile, manual_ss_criteria=0):
+        """
+        Instance holding attributes of the whole simulation
+        :param ion_dict: ion dictionary to be simulated, key is name and value is diffusion parameter D
+        :param potential_profile: list holding potential profile shape [L,a1,a2]
+        :param manual_ss_criteria: a typical velocity of the simulation, to use as reference velocity to check for ss
+        """
+
+        '''ratchet attributes'''
+        self.ion_dict = ion_dict.copy()
+        self.start_time = datetime.now()
+        self.end_time = datetime.now()  # will update at the end of the run
+        self.L = potential_profile[0]  # length of the ratchet, in mm
+        self.x_space_vec = potential_profile[1]  # preparation to set uneven step in the profile, currently only plot x
+        self.time_vec = potential_profile[2]  # every cell is the time of the corresponding profile to start
+        #  len(time_vec) = number of different profiles (example simple saw = 2)
+        self.potential_profile_mat = potential_profile[3]  # the potential_profile, every line is one prof,
+        # length of line can determine resolution (must be uniform)
+        self.flash_period = self.time_vec[-1]  # full cycle of the ratchet - T
+        self.flash_frequency = 1 / self.flash_period  # frequency cycle of the ratchet - f
+        self.interval = self.get_intervals()  # interval of one step - delta t
+        self.intervals_in_cycle = int(self.flash_period / self.interval)
+        self.max_cycles = get_setting('MAX_CYCLES')
+        '''simulation attributes'''
+        self.end_run = False  # the stop condition of the ratchet, update only in check for SS func
+        self.steady_state_code = 0  # 0 - None, 1 - SS by 3% standard, 2 - SS by 3% STD standard,
+        # 3 - ended by 100 runs, 4 - SS by 3% manual standard, update only in check for SS func
+        self.css = -1  # the # of cycles the ratchet get
+        self.resolution = get_setting('RESOLUTION')  # the min resolution of ions location and profile differentiation
+        if self.potential_profile_mat.shape[1] >= self.resolution:
+            self.resolution = self.potential_profile_mat.shape[1]
+
+        # all the array here are vector representation of ions, every column is the same ion in every vector
+
+        self.ion_d = np.array(list(ion_dict.values()) * get_setting("PARTICLES_SIMULATED"))  # ions d vector
+        self.ion_count = len(self.ion_d)
+        # self.ion_x = np.random.random(self.ion_count) * self.L  # start the run with random loc for every ion
+        self.ion_x = self.get_starting_pos()
+        self.ion_x_global = np.zeros([self.intervals_in_cycle, self.ion_count])
+        # the global loc of ion in cycle, updated every step, reset every cycle
+        self.ion_x_short_list = self.ion_x.copy()  # the loc of ions, updated every cycle
+        self.ion_charge = np.ones(self.ion_count)  # for now once only, setup for more complex logic
+        self.ion_area_count = np.zeros(self.ion_count)  # count the times that ion cross the ratchet length
+        self.velocity = np.zeros(self.ion_count)
+        self.step_time = self.interval / self.intervals_in_cycle
+
+        self.gamma = self.get_gamma()
+        self.velocity_means = np.array([])
+        self.manual_ss_criteria = manual_ss_criteria
+        self.random_movement_std = self.simulate_only_random_movement()
+
+    def get_gamma(self):
+        """
+        get gama for each ion by his d
+        """
+        gamma = BOLTZMANN_CONSTANT * TEMPERATURE / self.ion_d
+        return gamma
+
+    def get_starting_pos(self):
+        """
+        get avg loc of the ion approximation distribution in the ratchet
+        """
+        # the avg of profile
+        u_tot = np.zeros(len(self.potential_profile_mat[0]))
+        for profile in range(len(self.potential_profile_mat)):
+            if profile >= 1:
+                u_tot += self.potential_profile_mat[profile] * \
+                         (self.time_vec[profile] - self.time_vec[profile - 1]) / self.time_vec[-1]
+            else:
+                u_tot += self.potential_profile_mat[profile] * self.time_vec[profile] / self.time_vec[-1]
+        c_t = np.exp(u_tot / (BOLTZMANN_CONSTANT * TEMPERATURE))
+        norm = np.sum(c_t)
+        distribution = np.round(self.ion_count * c_t / norm, 0).astype(int)
+        while np.sum(distribution) != self.ion_count:
+            rand = np.random.randint(0, len(distribution) - 1)
+            if distribution[rand] >= 0:
+                distribution[rand] += np.sign(self.ion_count - np.sum(distribution))
+        pos = np.array([])
+        block_size = self.L / len(distribution)
+        for cell in range(len(distribution)):
+            pos = np.append(pos, distribution[cell] * [block_size * cell])
+        if len(pos) < self.ion_count:
+            raise ValueError
+        if len(pos) > self.ion_count:
+            pos = pos[:self.ion_count]
+        return pos
+
+    def get_intervals(self):
+        """
+        Calculates the length of a time interval delta_t
+        """
+        '''Check for manual dt overwrite in settings'''
+        if get_setting('OVERWRITE_DELTA_T'):
+            dt = get_setting('DELTA_T') * pow(10, -6)
+            return dt
+
+        # '''Special dt for electrons'''
+        # if self.ion == "Electrons in Silicon":
+        #     return self.flash_period / INTERVALS_FLASH_RATIO_ELECTRONS
+
+        '''keeps delta t smaller than tau (diffusion time for L)'''
+        critical_t = ((1 / INTERVALS_FLASH_RATIO) * self.L) ** 2 / (2 * np.min(list(self.ion_dict.values())))
+        '''Further diminishes delta t if its bigger that T/INTERVALS_FLASH_RATIO'''
+        while critical_t * 10 > self.flash_period / INTERVALS_FLASH_RATIO:  # dor fix
+            critical_t /= INTERVALS_FLASH_RATIO
+        critical_t = (self.flash_period / INTERVALS_FLASH_RATIO) / 100
+        return critical_t
+
+    def simulate_only_random_movement(self):
+        std_vec = []
+        for n, d in self.ion_dict.items():
+            x_diff = np.random.normal(0, 1, [self.intervals_in_cycle, 10000]) * np.sqrt(2 * d * self.interval)
+            b = np.average(x_diff[1:, :], axis=0) / self.interval
+            std_vec.append(np.std(b))
+        return np.array(std_vec)
+
+    # endregion
+
+    # region run
+    def run_rims(self):
+        """
+        the main func for simulation
+        return the steady state code:
+        1 - SS by 3% standard
+        2 - SS by 3% STD standard
+        3 - ended by 100 runs
+        4 - SS by 3% manual standard
+        5 - SS by std of last 5 runs < std of random movement only * 1.05
+        """
+        headline_panel()
+        cycle = 0
+        while not self.end_run:
+            cycle += 1
+            for interval in range(self.intervals_in_cycle):
+                profile_num = np.argmax(self.time_vec - interval * self.interval > 0)
+                profile = self.potential_profile_mat[profile_num]
+                electronic_field = get_electric_field_vec(profile, self.L, self.resolution)
+                electric_movement = get_electric_velocity(self.ion_x, self.gamma, electronic_field, self.L) * self.interval
+                ksai = np.random.normal(0, 1, self.ion_count)
+                noise_movement = ksai * np.sqrt(2 * self.ion_d * self.interval)
+                ion_new_loc = self.ion_x + electric_movement + noise_movement
+                ion_new_loc = self.calc_pos_arena(ion_new_loc, interval)  # update ion_x_global and ion_area_count
+                self.ion_x = ion_new_loc
+            self.update_short_list()  # update output data: ion_x_short_list, velocity
+            self.check_for_steady_state(cycle)
+            self.ion_x_global = np.zeros([self.intervals_in_cycle, self.ion_count])
+        self.end_time = datetime.now()
+        return self.steady_state_code
+
+    def check_for_steady_state(self, run_count):
+        """
+        Checks whether the system has reached ss
+        set the ss code:
+        1 - SS by 3% standard
+        2 - SS by 3% STD standard
+        3 - ended by 100 runs
+        4 - SS by 3% manual standard
+        5 - SS by std of last 5 runs < std of random movement only * 1.05
+        dor - tested for one ion type only after BIG change, probably do some trouble
+        """
+
+        # Allow for ss only after MIN_MEASUREMENTS_FOR_SS cycles
+        if run_count < MIN_MEASUREMENTS_FOR_SS - 1:
+            return
+        # calc avg velocity for every ion type separately, data for CYCLES_MEASUREMENTS_FOR_SS cycles
+        avg_velocity_mat = self.get_average_by_ion_type(self.velocity[-CYCLES_MEASUREMENTS_FOR_SS:, :])
+        mean_velocity = np.average(avg_velocity_mat, axis=0)
+        std_velocity = self.get_std_by_ion_type(self.velocity[-CYCLES_MEASUREMENTS_FOR_SS:, :])
+        # mean velocity of all the cycles CYCLES_MEASUREMENTS_FOR_SS
+        self.velocity_means = np.append(self.velocity_means, mean_velocity)
+        if np.abs(np.mean(np.abs(avg_velocity_mat[-1] - avg_velocity_mat[:-1])) / mean_velocity) < 0.03:
+            # if the mean deviation from the mean_velocity is 3% of the mean_velocity
+            self.steady_state_code = 1
+        if np.abs(np.std(avg_velocity_mat) / mean_velocity) < 0.03:
+            # if the std of last avg_velocity_mat is 3% of the mean_velocity
+            self.steady_state_code = 2
+        if self.manual_ss_criteria != 0:
+            # if manual_ss_criteria is defined and not 0
+            if np.abs(np.mean(np.abs(avg_velocity_mat[-1] - avg_velocity_mat[:-1])) / self.manual_ss_criteria) < 0.03:
+                # if the mean deviation from the mean_velocity is 3% of the manual_ss_criteria
+                self.steady_state_code = 4
+        if np.all(std_velocity < self.random_movement_std * 1.02):
+            # SS by std of last 5 runs < std of random movement only * 1.05
+            self.steady_state_code = 5
+        if run_count > 100:
+            # if the simulation run 100 cycles
+            # dor - 100 is total arbitrary number
+            self.steady_state_code = 3
+
+        if self.steady_state_code != 0:
+            '''Saves the cycle when ss was first reached'''
+            self.css = run_count
+            self.end_run = True
+        return
+
+    def get_average_by_ion_type(self, mat):
+        """
+        help func, calc avg of given mat for every ion type separately
+        """
+        avg_mat = []
+        for ion in self.ion_dict.values():
+            avg_mat.append(np.average(mat[:, self.ion_d == ion], axis=1))
+        return np.array(avg_mat).T
+
+    def get_std_by_ion_type(self, mat):
+        """
+        help func, calc avg of given mat for every ion type separately
+        """
+        avg_mat = []
+        for ion in self.ion_dict.values():
+            avg_mat.append(np.std(mat[:, self.ion_d == ion], axis=1))
+        return np.array(avg_mat).T
+
+    def calc_pos_arena(self, loc_array, interval):
+        """
+        if ion is out of bound returning him to the ratchet ("circular ratchet", "packman")
+        update the ion_x_global and ion_area_count
+        """
+        self.ion_x_global[interval] = loc_array + self.L * self.ion_area_count
+        mask_up = loc_array > self.L
+        mask_down = loc_array < 0
+        while np.any(mask_up + mask_down):
+            loc_array = loc_array - mask_up * self.L
+            self.ion_area_count += mask_up
+            loc_array = loc_array + mask_down * self.L
+            self.ion_area_count -= mask_down
+            mask_up = loc_array > self.L
+            mask_down = loc_array < 0
+        return loc_array.copy()
+
+    def update_short_list(self):
+        """
+        update the output data - avg loc of ion in each cycle and the avg velocity of ion at that cycle
+        ion_x_short_list
+        velocity
+        """
+        last_run_mat = self.ion_x_global
+        new_pos = np.average(self.ion_x_global, axis=0)
+        self.ion_x_short_list = np.vstack([self.ion_x_short_list, new_pos])
+        self.velocity = np.vstack([self.velocity,
+                                   np.average(last_run_mat[1:, :] - last_run_mat[:-1, :], axis=0)
+                                   / self.interval])
+
+    # endregion
+
+    # region plot and save
+    def get_x_to_plot(self):
+        plot_dict = {}
+        for key, val in self.ion_dict.items():
+            if len(self.ion_x_short_list.shape) == 2:
+                plot_dict[(key, val)] = self.ion_x_short_list[-1, self.ion_d == val]
+            else:
+                plot_dict[(key, val)] = self.ion_x_short_list[self.ion_d == val]
+        return plot_dict
+
+    def get_vec_to_plot(self):
+        return self.get_average_by_ion_type(self.velocity), self.ion_dict
+
+    def get_vec_and_err_to_plot(self):
+        return self.get_average_by_ion_type(self.velocity), self.ion_dict,\
+               self.get_std_by_ion_type(self.velocity)/np.sqrt(get_setting("PARTICLES_SIMULATED"))
+
+    def save_data(self, sub_file):
+        """
+        save all simulation data at the output dir at given sub_file
+        saves:
+        * velocity csv
+        * location csv
+        * avg velocity over cycles graph
+        * full simulation config txt
+        * TBA - start loc graph
+        * TBA - end loc graph
+        """
+        sub_dir = os.path.join(get_save_dir(), sub_file)
+        os.makedirs(sub_dir)
+        pd_vec = pd.DataFrame(self.velocity)
+        pd_vec.to_csv(os.path.join(sub_dir, "vec.csv"))
+        pd_loc = pd.DataFrame(self.ion_x_short_list)
+        pd_loc.to_csv(os.path.join(sub_dir, "loc.csv"))
+        v_plot_list, ions = self.get_vec_to_plot()
+        # unique_id = create_unique_id()
+        # plt.figure(unique_id)
+        plt.figure()
+        x_axis = np.arange(v_plot_list.shape[0])
+        avg_window = 0
+        for col in range(v_plot_list.shape[1]):
+            temp = v_plot_list[:, col].copy()
+            for cell in range(len(temp)):
+                temp[cell] = np.mean(v_plot_list[max(0, cell - avg_window):cell + 1, col])
+            plt.plot(x_axis, temp)
+        plt.xlabel(r"Ratchet Cycle")
+        plt.ylabel(r"Particle Velocity [cm/sec]")
+        plt.suptitle("RIMS: Average speed of ions over ratchet cycles", fontsize=14, fontweight='bold')
+        plt.legend = ions.keys()
+        plt.grid()
+        plt.savefig(os.path.join(sub_dir, "fig"))
+        plt.close()
+        run_data = ""
+        run_data += f"ion_dict: {str(self.ion_dict)}\n"
+        run_data += f"run_time: {str(self.end_time - self.start_time)}\n"
+        run_data += f"L: {str(self.L)}\n"
+        run_data += f"flash_period: {str(self.flash_period)}\n"
+        run_data += f"flash_frequency: {str(self.flash_frequency)}\n"
+        run_data += f"interval: {str(self.interval)}\n"
+        run_data += f"intervals_in_period: {str(self.intervals_in_cycle)}\n"
+        run_data += f"max_cycles: {str(self.max_cycles)}\n"
+        run_data += f"steady_state_code: {str(self.steady_state_code)}\n"
+        run_data += f"resolution: {str(self.resolution)}\n"
+        run_data += f"ion_count: {str(self.ion_count)}\n"
+        run_data += f"css: {str(self.css)}\n"
+        run_data += f"manual_ss_criteria: {str(self.manual_ss_criteria)}\n"
+        run_data += f"potential_profile_mat:\n {str(self.potential_profile_mat)}\n"
+        run_data += f"time_vec:\n {str(self.time_vec)}\n"
+        run_data += f"random_movement_std:\n {str(self.random_movement_std)}\n"
+        text_file = open(os.path.join(sub_dir, f"{sub_file}.txt"), "w")
+        text_file.write(run_data)
+        return sub_dir
+
+    def get_class_str_parameters(self):
+        """
+        help function for save and costume saves
+        """
+        return [
+            [
+                f"ion_dict", f"run_time", f"L", f"flash_period", f"flash_frequency", f"interval",
+                f"intervals_in_period", f"max_cycles", f"steady_state_code", f"resolution", f"ion_count",
+                f"css", f"manual_ss_criteria"
+            ],
+            [
+                str(self.ion_dict), str(self.end_time - self.start_time), str(self.L),
+                str(self.flash_period), str(self.flash_frequency), str(self.interval),
+                str(self.intervals_in_cycle), str(self.max_cycles), str(self.steady_state_code),
+                str(self.resolution), str(self.ion_count), str(self.css), str(self.manual_ss_criteria)
+            ]
+        ]
+    # endregion
+
+
+def normal_run():
+    """
+    Extraction of data from interface
+    dor - alot change from last run, this is just for get the idia
+    """
+    ion_selection_dict = ion_selection_panel()  # dor - how the ion dict see
+    '''Running simulation'''
+
+    # ion_selection_dict, potential_profile = fast_start([1, 2, 3], 1)
+    potential_profile = extract_data_from_interface()  # dor - same here
+
+    ion_selection_dict, potential_profile = set_prams_dc_sawtooth(diffusion=1 * 10 ** -5, length=1, xc=0.7,
+                                                                  dc=0.5, v_max=1, alpha=-1)
+    plot_potential_profile(potential_profile[3], potential_profile[1])
+    rims = Rims(ion_selection_dict, potential_profile)
+    plot_multiple_ions_hist(rims.get_x_to_plot(), rims.resolution)
+    # t = timeit(rims.run_rims,number=2)
+    # print(t)
+    print("SS?: " + str(rims.run_rims()))
+    plot_multiple_ions_hist(rims.get_x_to_plot(), rims.resolution)
+    vec, ions = rims.get_vec_to_plot()
+    plot_average_speed_of_ions(vec, ions)
+
+if __name__ == '__main__':
+    length = 1  # in nm
+    resolution = 1000  # number of singular points in the profile (and the length)
+    diffusion_dict = {"1.2*10^-5": 1.2 * 10 ** -5}  # dictionary of the different diffusion constants
+    folder_to_save = "first_run"  # save folder, will be in the output\{date_time}\ path,\
+    # handy for lots of simulations in single python run
+    time_vector = [0.35*5e-6, 5e-6]  # the first profile will start at t=0 and end at t=time_vector[0],
+    # the second start at t=time_vector[0] and end at time_vector[1] etc.
+    location_vector = [0, 0.3, 0.6, 1]  # in nm
+    # the physical location of the potential listed, all the value at the first column
+    # will be at x=location_vector[0], if the vector include x=0 but not x=length (or the other way around)
+    # the code will force the start and the end to the same potential (not tested),
+    # if neither listed both will be set on 0
+    potential_matrix = \
+        [
+            [0, 2, 1, 0],
+            [0, -0.5, -1, 0]
+        ]
+
+    custom_run(potential_matrix, time_vector, location_vector, length, resolution, diffusion_dict, folder_to_save)
+    #full_fig_6_reconstruct(0.2, 60, 2.5, False)
+
+
